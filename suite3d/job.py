@@ -46,6 +46,29 @@ from .iter_step import (
 from .default_params import get_default_params
 from . import ui
 
+# NOTE: New imports for Bruker data extensions
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tifffile import TiffFile
+
+import dask.array as da    # ← Dask array operations for replication & concatenation
+from suite3d.io.s3dio import s3dio
+
+import dask
+from dask import diagnostics
+from tifffile import imwrite
+from typing import Optional
+
+# TODO: Remove DEBUG IMPORTS and Decorations
+# NOTE: Profiler import
+from suite3d.dev_utils.profiler import profile
+import pandas as pd
+from suite3d.quality_metrics import compute_reference_quality_metrics
+from suite3d.utils import benchmark, save_benchmark_results, get_repo_status, find_git_root, aggregate_profiler_metrics
+from suite3d.dev_utils.profiler import (enable_profiler, disable_profiler, set_profiler_log_file,
+                                        extract_init_profiler_metrics)
+from pprint import pformat
+
 
 class Job:
     def __init__(
@@ -75,39 +98,317 @@ class Job:
             copy_parent_symlink (bool) : if copying dirs, you can optionally symlink them
             verbosity (int, optional): Verbosity level. 0: critical only, 1: info, 2: debug. Defaults to 1.
         """
+        # ─── Begin timing instrumentation ───────────────────────
+        t0 = time.time()
+        print(f"[{time.time() - t0:.3f}s] → Entering Job.__init__: "
+              f"create={create}, brukerlazy={params.get('bruker_lazy')}")
+        # ─── End timing instrumentation ─────────────────────────
+
+        # ─── Normalize root_dir ───────────────────────────────────────
         if isinstance(root_dir, Path):
             root_dir = str(root_dir)
+        print(f"[{time.time() - t0:.3f}s]   • normalized root_dir")
 
+        # ─── Set basic attributes ─────────────────────────────────────
         self.verbosity = verbosity
         self.job_id = job_id
         self.summary = None
         self.timers = {}
+        print(f"[{time.time() - t0:.3f}s]   • init attributes")
 
         if create:
+            # ─── Copy from parent if requested ───────────────────────────
             if parent_job is not None:
+                print(f"[{time.time() - t0:.3f}s]   → parent_job branch")
                 self.init_job_dir(root_dir, job_id, exist_ok=overwrite)
-                return self.copy_parent_job(
-                    parent_job, copy_parent_dirs, copy_parent_symlink
-                )
+                print(f"[{time.time() - t0:.3f}s]    • init_job_dir done (parent)")
+                return self.copy_parent_job(parent_job, copy_parent_dirs, copy_parent_symlink)
+
+            # ─── initialize directories, load defaults & user params ───
             self.init_job_dir(root_dir, job_id, exist_ok=overwrite)
+            print(f"[{time.time() - t0:.3f}s]   • init_job_dir completed")
+
+            # ─── Load and merge default params ─────────────────────────
             def_params = get_default_params()
+            print(f"[{time.time() - t0:.3f}s]   • got default params ({len(def_params)} keys)")
             self.log("Loading default params")
             for k, v in params.items():
-                assert k in def_params.keys(), "%s not a valid parameter" % k
-                self.log("Updating param %s" % (str(k)), 2)
+                assert k in def_params, f"{k} not a valid parameter"
+                self.log(f"Updating param {k}", 2)
                 def_params[k] = v
             self.params = def_params
+            print(f"[{time.time() - t0:.3f}s]   • merged user params ({len(self.params)} keys)")
+
+            # ─── Assign TIFF list ──────────────────────────────────────
             assert tifs is not None, "Must provide tiff files"
             self.params["tifs"] = tifs
             self.tifs = tifs
-            self.preregister_tifs()
-            self.save_params()
+            print(f"[{time.time() - t0:.3f}s]   • assigned {len(self.tifs)} tifs")
+
+            # ─── Bruker-lazy streaming path ────────────────────
+            if self.params.get("bruker_lazy", False):
+                print(f"[{time.time() - t0:.3f}s]   → entering _preregister_bruker_lazy()")
+                self.log("ℹ️  Bruker-lazy: skipping multipage conversion", 1)
+                # build in-memory prereg maps only
+                self._preregister_bruker_lazy()
+                print(f"[{time.time() - t0:.3f}s]    • returned from _preregister_bruker_lazy()")
+
+                # TODO: Figure out if I want/need to do this or not
+                # ─── OPTIONAL: persist minimal params (uncomment if desired) ───
+                # minimal = {k: v for k, v in self.params.items()
+                #            if k not in ("frame_counts","extra_frames","previous_tif")}
+                # self.params = minimal
+                # self.save_params()
+
+            else:
+                # ─── Bruker multipage conversion ────────────────
+                if self.params.get("bruker", False) and self.params.get("convert_multipage", False):
+                    print(f"[{time.time() - t0:.3f}s]   → starting multipage conversion")
+                    plane_dir = Path(self.job_dir) / "converted" / "per_plane"
+                    if not plane_dir.exists() or not any(plane_dir.glob("*.ome.tif")):
+                        self.log("🔄 Converting Bruker TIFFs to multipage stacks…", 1)
+                        self._convert_bruker_stacks()
+                        print(f"[{time.time() - t0:.3f}s]    • conversion done")
+                        self.log(f"✔ Done conversion: {len(self.tifs)} per-plane files", 1)
+                    else:
+                        print(f"[{time.time() - t0:.3f}s]    • conversion skipped")
+                        self.log("✔ Found existing converted TIFFs; skipping conversion", 1)
+
+                # ─── preregistration of (possibly converted) TIFFs ────────
+                print(f"[{time.time()-t0:.3f}s]   → about to preregister_tifs()")
+                self.preregister_tifs()
+                print(f"[{time.time()-t0:.3f}s]    • preregister_tifs() done")
+
+                # ─── only in the non-lazy branch do we write out params ───
+                print(f"[{time.time() - t0:.3f}s]   → saving params")
+                self.save_params()
+                print(f"[{time.time() - t0:.3f}s]    • save_params() done")
 
         else:
-            self.job_dir = os.path.join(root_dir, "s3d-%s" % job_id)
+            # ─── load existing job ───────────────────────────────────────
+            print(f"[{time.time() - t0:.3f}s]   → loading existing job")
+            self.job_dir = os.path.join(root_dir, f"s3d-{job_id}")
             self.load_dirs()
+            print(f"[{time.time() - t0:.3f}s]    • load_dirs() done")
             self.load_params(params_path=params_path)
+            print(f"[{time.time() - t0:.3f}s]    • load_params() done")
             self.tifs = self.params.get("tifs", [])
+            print(f"[{time.time() - t0:.3f}s]    • loaded {len(self.tifs)} tifs")
+
+        # ─── Constructor complete ──────────────────────────────────
+        print(f"[{time.time() - t0:.3f}s] ← Job.__init__ complete")
+
+
+    def generate_registered_zstack(
+            self,
+            methods: list = ["mean"],
+            mov_reg=None,
+            planes: Optional[list] = None,
+            save_npy: bool = True,
+            save_tif: bool = True,
+            output_dir: Optional[str] = None,
+            verbose: bool = True
+    ):
+        """
+        Generate and optionally save z-projections from the registered movie.
+
+        Args:
+            methods (list): List of projection methods to apply. Options include "mean", "max", "median".
+                            Can include multiple values, e.g. ["mean", "max"].
+            mov_reg (dask.array.Array, optional): Registered movie (Z, T, Y, X). If None, attempts to
+                load from job.get_registered_movie(). If the movie is not persisted, it will be persisted.
+            planes (list, optional): Subset of z-planes to include in the projection.
+            save_npy (bool): Whether to save output .npy files.
+            save_tif (bool): Whether to save output .tif files.
+            output_dir (str, optional): Override the default output directory.
+            verbose (bool): Whether to print verbose logs.
+
+        Returns:
+            dict: Dictionary mapping method names to 2D numpy arrays (projections).
+        """
+
+        methods = [methods] if isinstance(methods, str) else methods
+
+        if mov_reg is None:
+            if verbose:
+                print("➜ Loading registered movie as Dask array …")
+            mov_reg = self.get_registered_movie()
+
+        # Ensure Dask movie is persisted only once
+        if not dask.base.is_dask_collection(mov_reg):
+            if verbose:
+                print("✔︎ Registered movie already computed (non-Dask). Proceeding…")
+        elif not hasattr(mov_reg, "_persisted"):
+            if verbose:
+                print("➜ Persisting registered movie in memory …")
+            with diagnostics.ProgressBar():
+                mov_reg = mov_reg.persist()
+            mov_reg._persisted = True
+            if verbose:
+                print("✔︎ Persisted. Proceeding with projection …")
+        elif verbose:
+            print("✔︎ Using already persisted registered movie …")
+
+        # Apply plane filtering
+        if planes is not None:
+            if verbose:
+                print(f"➜ Restricting to planes: {planes}")
+            mov_reg = mov_reg[planes, ...]
+
+        job_dir = self.dirs.get("job_dir")
+        if job_dir is None:
+            raise AttributeError("Job is missing 'job_dir' in self.dirs")
+
+        if output_dir is None:
+            output_dir = os.path.join(job_dir, "zstack")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        result = {}
+        for method in methods:
+            if verbose:
+                print(f"➜ Computing z-projection using method: {method}")
+            if method == "mean":
+                zstack = mov_reg.mean(axis=1)
+            elif method == "max":
+                zstack = mov_reg.max(axis=1)
+            elif method == "median":
+                zstack = da.median(mov_reg, axis=1)
+            else:
+                raise ValueError(f"Unsupported projection method: {method}")
+
+            zstack_np = zstack.compute()
+            result[method] = zstack_np
+
+            if save_npy:
+                fname_npy = os.path.join(output_dir, f"registered_zstack_{method}.npy")
+                n.save(fname_npy, zstack_np)
+                if verbose:
+                    print(f"✔︎ Saved zstack (npy) to: {fname_npy}")
+
+            if save_tif:
+                fname_tif = os.path.join(output_dir, f"registered_zstack_{method}.tif")
+                imwrite(fname_tif, zstack_np.astype(n.float32))
+                if verbose:
+                    print(f"✔︎ Saved zstack (tif) to: {fname_tif}")
+
+        return result, mov_reg
+
+
+    def _preregister_bruker_lazy(self):
+        """
+        Minimal lazy prereg stub that stays within Suite3D’s existing params:
+          • Reads only the TIFF header to get H×W.
+          • Extracts base_dir/prefix/suffix.
+          • Stubs out frame_counts/extra_frames/previous_tif.
+        """
+
+        t0 = time.time()
+        print(f"[{time.time() - t0:.3f}s] → START _preregister_bruker_lazy()")
+
+        sample = Path(self.tifs[0])
+        base_dir = str(sample.parent)
+
+        # extract prefix/suffix
+        m = re.match(r"(.+?)(_Cycle\d+_Ch\d+_\d{6}\.ome\.tif)$", sample.name)
+        if not m:
+            raise RuntimeError("Filename doesn’t match Bruker pattern")
+        prefix, suffix = m.group(1), m.group(2)
+        print(f"[{time.time() - t0:.3f}s]   • got prefix/suffix")
+
+        # header-only read
+        with TiffFile(str(sample)) as tif:
+            page = tif.pages[0]
+            H = getattr(page, 'imagelength', None) or page.shape[-2]
+            W = getattr(page, 'imagewidth', None) or page.shape[-1]
+        print(f"[{time.time() - t0:.3f}s]   • header H×W = {H}×{W}")
+
+        # Infer P, C, and F from the full job.tifs list
+        total_files = len(self.tifs)
+        C = self.params.get("num_colors", 1)
+        # you expect planes = list(self.params["planes"])
+        P = len(self.params["planes"])
+        F = total_files // (P * C)
+
+        # write only new metadata (no new frame/plane keys)
+        self.params.update({
+            "bruker_base_dir": str(base_dir),
+            "bruker_filename_prefix": prefix,
+            "bruker_filename_suffix": suffix,
+            "y_pixels": H,
+            "x_pixels": W,
+            "n_planes": P,
+            "num_colors": C,
+            "n_frames": F,
+            "frames_per_plane": F,  # useful alias
+        })
+
+        # stub out legacy prereg maps
+        self.params["frame_counts"] = {}
+        self.params["extra_frames"] = {}
+        self.params["previous_tif"] = {}
+        self.summary = None
+
+        print(f"[{time.time() - t0:.3f}s] ← END _preregister_bruker_lazy() "
+              f"({time.time() - t0:.3f}s total)")
+
+    # NOTE: New Bruker functionality
+    def _convert_bruker_stacks(self):
+        """
+        Parallel conversion of Bruker single‐page TIFFs into per‐plane multipage stacks,
+        using all available CPU cores for concurrent I/O.
+        """
+
+        job_dir   = Path(self.job_dir)
+        plane_dir = job_dir / "converted" / "per_plane"
+        plane_dir.mkdir(parents=True, exist_ok=True)
+
+        # Gather (plane, frame, path) entries
+        pat = re.compile(r".*_Cycle(\d+)_Ch(\d+)_([0-9]{6})\.ome\.tif$", re.IGNORECASE)
+        entries = []
+        for raw in self.tifs:
+            name = Path(raw).name
+            m = pat.match(name)
+            if not m:
+                self.log(f"[convert] skipping unmatched: {name}", 2)
+                continue
+            plane, ch1, frame = map(int, m.groups())
+            if (ch1 - 1) != self.params["functional_color_channel"]:
+                continue
+            # convert to 0-index immediately
+            entries.append((plane - 1, frame, raw))
+
+        if not entries:
+            raise RuntimeError("No Bruker TIFFs matched for conversion.")
+
+        planes = sorted({pl for pl, _, _ in entries})
+        total  = len(planes)
+
+        # Use all available logical cores, but no more threads than planes
+        num_cores  = os.cpu_count() or 1
+        max_workers = min(num_cores, total)
+        self.log(f"🛠️  Converting on {max_workers} threads (detected {num_cores} cores)…", 1)
+
+        def convert_one(plane):
+            fps = sorted([ (f,p) for (pl,f,p) in entries if pl == plane ], key=lambda x:x[0])
+            outp = plane_dir / f"plane{plane:03d}.ome.tif"
+            with tifffile.TiffWriter(str(outp), bigtiff=True) as writer:
+                for _, pth in fps:
+                    img = tifffile.imread(pth)
+                    writer.write(img)
+            return plane
+
+        # Launch parallel conversion
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(convert_one, pl): pl for pl in planes}
+            for idx, future in enumerate(as_completed(futures), start=1):
+                pl_done = futures[future]
+                self.log(f"   ✅ Plane {pl_done} done ({idx}/{total})", 1)
+
+        # Update self.tifs to the new per-plane list
+        new_list = sorted(str(p) for p in plane_dir.glob("*.ome.tif"))
+        self.params["tifs"] = new_list
+        self.tifs = new_list
 
     def preregister_tifs(self):
         """
@@ -220,7 +521,9 @@ class Job:
         if logfile:
             logfile = os.path.join(self.job_dir, "log.txt")
             self.logfile = logfile
-            with open(logfile, "a+") as f:
+            # open in utf-8 and replace any unencodable chars
+            # with open(logfile, "a+") as f: # TODO: check this doesn't cause problems elsewhere
+            with open(logfile, "a+", encoding="utf-8", errors="replace") as f:
                 datetime_string = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 header = "\n[%s][%02d] " % (datetime_string, level)
                 f.write(header + "   " * level + string)
@@ -476,6 +779,8 @@ class Job:
                 self.log("Found dir %s" % dir_name, 2)
         n.save(os.path.join(job_dir, "dirs.npy"), self.dirs)
 
+    # TODO: Remove this after development
+    @profile(timeit=True, mem=True, gpu=True, shapes=True, gpu_sample_interval=0.2)
     def run_init_pass(self):
         self.save_params(copy_dir_tag="summary")
         self.log("Launching initial pass", 0)
@@ -533,6 +838,8 @@ class Job:
             if summary["fuse_shifts"] is not None:
                 utils.plot_fuse_shifts(summary["fuse_shifts"], summary["fuse_ccs"])
 
+    # TODO: Remove this after development
+    @profile(timeit=True, mem=True, gpu=True, shapes=True, gpu_sample_interval=0.2)
     def register(self, tifs=None):
         """
         Register the dataset using the method specified in job.params.
@@ -675,6 +982,7 @@ class Job:
             n_combs = n.prod(n_per_param)
             combinations = list(itertools.product(*param_vals_list))
         else:
+            combinations = []   # TODO: Confirm this is right
             n_combs = n.sum(n_per_param)
             base_vals = [init_params[param_name] for param_name in param_names]
             for i in range(n_combs):
@@ -698,10 +1006,14 @@ class Job:
             comb_str = "comb%05d-params" % comb_idx
             for param_idx, param in enumerate(param_names):
                 param_value = comb[param_idx]
-                if type(param_value) == str or type(param_value) == n.str_:
+                if isinstance(param_value, (float, int)):
+                    val_str = f"{param_value:.03f}" if isinstance(param_value, float) else str(param_value)
+                elif isinstance(param_value, (list, tuple)):
+                    val_str = "x".join(str(v) for v in param_value)
+                elif isinstance(param_value, (str, n.str_)):
                     val_str = param_value
                 else:
-                    val_str = "%.03f" % param_value
+                    val_str = str(param_value)
                 comb_str += "-%s_%s" % (param, val_str)
                 comb_param[param] = param_value
             comb_dir_tag = "comb_%05d" % comb_idx
@@ -845,6 +1157,212 @@ class Job:
         self.save_file("sweep_summary", sweep_summary, path=sweep_dir_path)
         self.params = sweep_summary["init_params"]
         return sweep_summary
+
+
+    def sweep_reference_params(
+            self,
+            params_to_sweep,
+            sweep_name="ref_quality_sweep",
+            export_tiff=True,
+            compute_metrics=True,
+            all_combinations=True,
+            run_benchmarking=False,
+            benchmark_tag=None,
+            reset_benchmark_baselines=False,
+            profiling=False,
+    ):
+        """
+        Sweep over reference-building (init_pass) parameters and evaluate resulting volumes.
+
+        For each parameter combination:
+        - Runs job.run_init_pass() using updated parameters
+        - Saves the resulting 3D reference volume as a TIFF for visual inspection (optional)
+        - Computes blind image quality metrics for the reference volume (optional)
+        - Saves runtime timing and profiler logs (optional)
+        - Optionally runs benchmarking comparisons against a baseline
+
+        Args:
+            self: Suite3D Job object.
+            params_to_sweep (dict): Dictionary mapping param names to lists of values to sweep.
+            sweep_name (str): Name of the sweep. Used to label output directory under 'sweeps/'.
+            export_tiff (bool): Whether to export each resulting reference volume to a TIFF file.
+            compute_metrics (bool): Whether to compute blind image quality metrics (e.g., PCA variance).
+            all_combinations (bool): If True, do full Cartesian product of parameter values.
+                                     If False, vary one parameter at a time around the base config.
+            run_benchmarking (bool): Whether to run benchmarking comparisons using saved Suite3D utilities.
+            benchmark_tag (str or None): Label to use for identifying the benchmark run. If None, an automatic
+                                         timestamped tag is generated (e.g., 'ref_benchmark_2025-07-31_22-16-08').
+            reset_benchmark_baselines (bool): If True, existing benchmark baselines will be cleared and overwritten.
+            profiling (bool): If True, runs each init_pass under the Suite3D profiler and saves per-run logs.
+
+        Returns:
+        pd.DataFrame or None: If compute_metrics is True, returns a DataFrame containing parameter combinations,
+                              metrics, runtimes, and sweep metadata. Otherwise returns None.
+    """
+
+        # Create benchmark tag
+        if run_benchmarking:
+            if benchmark_tag is None:
+                benchmark_tag = "refbench-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+            results_dir = Path(self.dirs["job_dir"]) / "benchmark_ref" / benchmark_tag
+            if reset_benchmark_baselines and results_dir.exists():
+                shutil.rmtree(results_dir)
+                print(f"[RESET] Cleared benchmark baselines at {results_dir}")
+
+        sweep_summary = self.setup_sweep(
+            params_to_sweep=params_to_sweep,
+            sweep_name=sweep_name,
+            all_combinations=all_combinations,
+        )
+
+        all_metrics = []
+
+        for i, (params, out_dir) in enumerate(zip(
+                sweep_summary["comb_params"], sweep_summary["comb_dirs"]
+        )):
+            print(f"\n▶ Sweep {i + 1}/{len(sweep_summary['comb_dirs'])} — {out_dir}")
+
+            self.params = params
+            self.dirs["job_dir"] = out_dir
+            vol_metrics = None
+
+            # ── Create a logging-friendly version of params
+            params_for_log = {
+                k: ("<omitted — list of TIFF file paths>" if k == "tifs" else v)
+                for k, v in self.params.items()
+            }
+
+            # ── Log the readable version (with TIFFs omitted)
+            self.log(f"[SWEEP INFO] Final parameters for this run:\n{pformat(params_for_log)}", 1)
+
+            # ── Save the same readable version to a text file
+            param_txt_path = os.path.join(self.dirs["job_dir"], "final_params.txt")
+            with open(param_txt_path, "w") as f:
+                f.write(pformat(params_for_log))
+
+            # ── Save the actual full version (including TIFF list) as .npy
+            self.save_file("final_params", self.params, path=self.dirs["job_dir"])
+
+            if (Path(out_dir) / "summary.npy").exists():
+                print("✔︎ Found existing summary; loading instead of re-running init_pass()")
+                self.summary = self.load_summary()
+                runtime = None
+            else:
+                print("➜ Running run_init_pass() …")
+                t0 = time.time()
+                if profiling:
+                    enable_profiler()
+                    profiler_log = Path(out_dir) / "profiler_log_init.txt"
+                    set_profiler_log_file(profiler_log)
+                self.run_init_pass()
+                if profiling:
+                    disable_profiler()
+                t1 = time.time()
+                runtime = t1 - t0
+                print(f"✔︎ run_init_pass() complete in {runtime:.2f} s")
+
+            if profiling:
+                profiler_metrics = extract_init_profiler_metrics(self.dirs["job_dir"])
+                # Save profiler metrics for the current iteration
+                df = pd.DataFrame([profiler_metrics])
+                csv_path = Path(out_dir) / "profiler_metrics.csv"
+                df.to_csv(csv_path, index=False)
+
+            ref3d = self.summary.get("ref_img_3d")
+            if ref3d is None:
+                print("[WARN] No reference image found in job.summary — skipping.")
+                continue
+
+            # Save TIFF for inspection
+            if export_tiff:
+                tiff_path = Path(out_dir) / "ref_img_3d.tif"
+                tifffile.imwrite(str(tiff_path), ref3d.astype("float32"))
+                print(f"✔︎ Saved reference to {tiff_path}")
+
+            # ──────────────────────────────────────────────────────────────
+            # Compute reference quality metrics and optionally benchmark
+            # ──────────────────────────────────────────────────────────────
+            if compute_metrics:
+                vol_metrics = compute_reference_quality_metrics(ref3d)
+
+                # Log scalar summaries for sweep visibility
+                print(f"⎆ Sweep #{i} metrics summary:")
+                for k, v in vol_metrics.items():
+                    if isinstance(v, n.ndarray):
+                        print(f"  {k}: mean={v.mean():.4f}, std={v.std():.4f}")
+                    else:
+                        print(f"  {k}: {v:.4f}")
+
+                # Prepare row with scalar summaries (mean over Z for arrays)
+                row = {
+                    "sweep_idx": i,
+                    "out_dir": str(out_dir),
+                    "runtime_sec": runtime,
+                    **params,
+                    **{k: v.mean() if isinstance(v, n.ndarray) else v for k, v in vol_metrics.items()}
+                }
+                all_metrics.append(row)
+
+                # Save detailed metrics as .npz
+                metrics_path = Path(out_dir) / "volume_metrics.npz"
+                n.savez(metrics_path, **vol_metrics)
+
+            # ──────────────────────────────────────────────────────────────
+            # Run benchmarking using vol_metrics outputs
+            # ──────────────────────────────────────────────────────────────
+            if run_benchmarking and (vol_metrics is not None):
+                repo_status = get_repo_status(find_git_root())
+                timings = {"init_pass": runtime} if runtime is not None else {}
+
+                # Package all relevant metric outputs for benchmarking
+                outputs = {
+                    "signal_range": vol_metrics["signal_range"],
+                    "signal_to_background_ratio": vol_metrics["signal_to_background_ratio"],
+                    "mean_fluorescence": vol_metrics["mean_fluorescence"],
+                    "volume_std": vol_metrics["volume_std"],
+                    "histogram_entropy": vol_metrics["histogram_entropy"],
+                    "histogram_kurtosis": vol_metrics["histogram_kurtosis"],
+                    "pca_explained_variance_ratio": vol_metrics["pca_explained_variance_ratio"],  # scalar
+                }
+                if profiling:
+                    timings.update({"init_elapsed_s": profiler_metrics.get("init_elapsed_s")})
+                    outputs.update({
+                        "init_mem_delta_mb": profiler_metrics.get("init_mem_delta_mb"),
+                        "init_rss_delta_mb": profiler_metrics.get("init_rss_delta_mb"),
+                        "init_gpu_peak_mb": profiler_metrics.get("init_gpu_peak_mb"),
+                        "init_gpu_util_pct": profiler_metrics.get("init_gpu_util_pct"),
+                    })
+
+                is_baseline = (i == 0)
+                save_benchmark_results(
+                    results_dir,
+                    outputs,
+                    timings,
+                    repo_status,
+                    is_baseline=is_baseline,
+                )
+
+                if not is_baseline:
+                    print("➜ Benchmarking against baseline …")
+                    benchmark(results_dir, outputs, timings, repo_status)
+
+        # aggregate, save, and print the profiler metrics
+        if profiling:
+            aggregate_profiler_metrics(sweep_summary["sweep_dir_path"],
+                                       output_filename="all_profiler_metrics.csv",
+                                       verbose=True,
+                                       max_rows=None)
+
+        # Collate to CSV for summary
+        if compute_metrics and all_metrics:
+            df = pd.DataFrame(all_metrics)
+            csv_path = Path(sweep_summary["sweep_dir_path"]) / "all_metrics.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"✔︎ Saved sweep summary CSV to {csv_path}")
+            return df
+        else:
+            print("[WARN] No metrics computed or nothing to save.")
+            return None
 
     def make_svd_dirs(self, n_blocks=None):
         self.make_new_dir("svd")

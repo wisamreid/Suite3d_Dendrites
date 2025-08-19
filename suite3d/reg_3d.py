@@ -3,6 +3,7 @@ import os
 import numpy as n
 
 from .reference_image import HAS_CUPY
+from .utils import default_log
 
 np = n
 
@@ -23,6 +24,8 @@ from numba import njit
 from . import reference_image as ref
 from . import register_gpu as reg
 from . import utils
+
+from suite3d.dev_utils.profiler import with_progress
 
 
 @njit(nogil=True, cache=True)
@@ -922,32 +925,56 @@ def shift_mov_lbm_gpu(mov_gpu, plane_shifts, fill_value=0):
 
 
 # decide when/where to calc/get masks + fft'd filterd ref img
-def reg_3d_gpu(mov_batch_gpu, fft_3d_ref_conj):
+def reg_3d_gpu(mov_batch_gpu, fft_3d_ref_conj, log_cb=default_log):
     """
-    fourier transform and multiply a 3D movie batch and the reference, ran on the GPU
+    Register a 3D movie batch against a reference volume using FFT-based phase correlation (GPU version).
+
+    This function operates entirely on the GPU using CuPy and cuFFT. It performs:
+      1. 3D FFT over (z, y, x) axes for each timepoint
+      2. Per-frame normalization (amplitude)
+      3. Element-wise multiplication with the conjugate reference FFT
+      4. Inverse FFT to produce phase correlation volume for each frame
 
     Parameters
     ----------
-    mov_batch_gpu : ndarray (nz, nt_batch, ny, nx)
-        A batch of the movie which needs to be registered, on the gpu
-    fft_3d_ref_conj : ndarray (nz, ny, nx)
-        The filterd fourrier transformed refference image
+    mov_batch_gpu : cp.ndarray (nz, nt_batch, ny, nx)
+        A batch of the movie to be registered, already on the GPU.
+
+    fft_3d_ref_conj : np.ndarray or cp.ndarray (nz, ny, nx)
+        The precomputed filtered, conjugated FFT of the reference volume (CPU or GPU).
+
+    log_cb : callable
+        Optional logging callback (e.g., for verbosity control or debugging).
 
     Returns
     -------
-    ndarray (nz,nt_batch, ny, nx)
-        The full phase_correlation for this frame
-    """
-    nz, nt, ny, nx = mov_batch_gpu.shape
+    cp.ndarray (nt_batch, nz, ny, nx)
+        The phase correlation volume for each frame, swapped to (t, z, y, x) order.
 
+    Notes
+    -----
+    - Assumes CuPy is available and that both input arrays are already GPU-resident.
+    - Normalization is done per-frame to avoid magnitude-based bias.
+    - FFT is done over z, y, x axes only.
+    - Use `with_progress(...)` to track per-frame progress.
+    """
+
+    nz, nt, ny, nx = mov_batch_gpu.shape
+    log_cb(f"mov_batch_gpu.shape: nz: {nz}, nt: {nt}, ny: {ny}, nx: {nx}", 3)
     fft_3d_ref_conj_gpu = cp.asarray(fft_3d_ref_conj)
     phase_corr_batch = cp.zeros((nt, nz, ny, nx), dtype=cp.float64)
     # Using  cpy fftn
     fft_3d_mov = cufft.fftn(mov_batch_gpu[:, :, :, :], axes=(0, 2, 3))
 
-    for t in range(nt):
+    # for t in range(nt):
+    #     fft_3d_mov[:, t, :, :] = fft_3d_mov[:, t, :, :] / (
+    #         1e-5 + cp.abs(fft_3d_mov[:, t, :, :])
+    #     )
+    # Normalize and multiply per-frame
+    for t in with_progress(range(nt), desc="Registering batch (GPU)"):
+        # Normalize each frame's 3D FFT magnitude
         fft_3d_mov[:, t, :, :] = fft_3d_mov[:, t, :, :] / (
-            1e-5 + cp.abs(fft_3d_mov[:, t, :, :])
+                1e-5 + cp.abs(fft_3d_mov[:, t, :, :])
         )
         fft_3d_mov[:, t, :, :] = fft_3d_mov[:, t, :, :] * fft_3d_ref_conj_gpu
 
@@ -983,6 +1010,7 @@ def process_phase_corr_gpu(phase_corr, pc_size):
         The sub pixel shift estiamted from the phase correlation
 
     """
+
     max_pc_size = pc_size * 2 + 1
     nt, nz, ny, nx = phase_corr.shape
     phase_corr_shifted = cp.zeros(

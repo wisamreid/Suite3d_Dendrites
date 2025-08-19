@@ -36,6 +36,11 @@ try:
 except ImportError:
     pass
 
+from pathlib import Path
+import pandas as pd
+
+import math
+
 colors = ["#90be6d", "#e98a15", "#b26c98", "#1b9aaa", "#3a405a"]
 
 
@@ -994,3 +999,210 @@ def plot_ct_hist(crosstalk_planes, show_plots=True, save_plots=None):
 
 #     titles = ["Cavity A", "Cavity B", "Cavity B crosstalk sub"]
 #     tfu.animate_gif(animate_planes, plot_gif, titles=titles)
+
+
+def find_git_root(start_path: str = None) -> str:
+    """
+    Walks up from start_path (or the current file’s directory) until it finds a folder containing ".git".
+    Returns the absolute path to that folder, or raises if none is found.
+    """
+    if start_path is None:
+        # If this file is in <repo>/some/subdir/script.py, __file__ points there:
+        start = Path(__file__).resolve().parent
+    else:
+        start = Path(start_path).resolve()
+
+    for parent in (start, *start.parents):
+        if (parent / ".git").is_dir():
+            return str(parent)
+    raise RuntimeError(f"No .git folder found above {start!r}")
+
+
+def aggregate_profiler_metrics(sweep_dir: str, output_filename: str = "all_profiler_metrics.csv",
+                               verbose: bool = False, max_rows=None):
+    """
+    Aggregate per-iteration profiler metrics from combo_* subdirectories.
+
+    Args:
+        sweep_dir (str): Path to the sweep directory (contains combo_XXXXX folders).
+        output_filename (str): Filename for saving aggregated CSV.
+        verbose (bool): Whether to print the table to the console.
+
+    Returns:
+        pd.DataFrame: Aggregated profiler metrics.
+    """
+
+    sweep_path = Path(sweep_dir)
+    all_rows = []
+    for combo_dir in sweep_path.glob("combo_*"):
+        metrics_file = combo_dir / "profiler_metrics.csv"
+        if metrics_file.exists():
+            df = pd.read_csv(metrics_file)
+            df["combo_id"] = combo_dir.name  # e.g., combo_00002
+            all_rows.append(df)
+
+    if not all_rows:
+        print("[WARN] No profiler metrics found.")
+        return None
+
+    full_df = pd.concat(all_rows, ignore_index=True)
+    save_path = sweep_path / output_filename
+    full_df.to_csv(save_path, index=False)
+
+    if verbose:
+        with pd.option_context('display.max_rows', max_rows, 'display.width', 120):
+            print("\n[Profiler Summary Across Sweep Iterations]")
+            print(full_df)
+
+    return full_df
+
+
+def estimate_ref_gpu_memory_bytes(nt, nz, ny, nx,
+                                  bytes_per_voxel=8,
+                                  live_buffers=2):
+    """
+    Estimate GPU bytes needed during 3D rigid FFT/phase-correlation
+    for a chunk of nt timepoints (batch), nz planes, ny*nx pixels.
+
+    Default assumes float64 (8 bytes) and ~2 large arrays live at once
+    (e.g., the phase-corr/FFT work buffer + one other large buffer).
+    Adjust `live_buffers` if your call site clearly holds more/fewer.
+
+    Returns: int bytes
+    """
+    voxels = nt * nz * ny * nx
+    return voxels * bytes_per_voxel * live_buffers
+
+
+def max_safe_nt_chunk(nz, ny, nx,
+                      free_vram_bytes,
+                      safety=0.85,
+                      bytes_per_voxel=8,
+                      live_buffers=2,
+                      min_nt=1):
+    """
+    Compute a safe upper bound for gpu_reference_batch_size (nt_chunk).
+
+    Args:
+      nz, ny, nx: volume dimensions used by the 3D rigid step
+      free_vram_bytes: current free GPU VRAM (from NVML)
+      safety: keep only this fraction of free VRAM for the large ops
+      bytes_per_voxel: 8 for float64 (most conservative); 4 for float32
+      live_buffers: large arrays live simultaneously (2–3 conservative)
+      min_nt: never return less than this
+
+    Returns:
+      nt_max (int): maximum safe time-batch size
+    """
+    usable = int(free_vram_bytes * safety)
+    denom = nz * ny * nx * bytes_per_voxel * live_buffers
+    if denom <= 0:
+        return min_nt
+    nt_max = usable // denom
+    return max(int(nt_max), min_nt)
+
+
+def required_vram_for_nt(nt, nz, ny, nx,
+                         bytes_per_voxel=8,
+                         live_buffers=2):
+    """
+    Convenience wrapper to report required bytes for a desired nt.
+    """
+    return estimate_ref_gpu_memory_bytes(nt, nz, ny, nx,
+                                         bytes_per_voxel=bytes_per_voxel,
+                                         live_buffers=live_buffers)
+
+
+def bytes_gib(nbytes: int) -> float:
+    return nbytes / (1024**3)
+
+
+def estimate_ref3d_vram_bytes_per_batch(
+    nz: int,
+    ny: int,
+    nx: int,
+    dtype_bytes: int = 4,   # float32 on device
+    complex_bytes: int = 8, # complex64 in FFT
+    safety_mult: float = 3.0,
+) -> callable:
+    """
+    Return a function f(nt) -> estimated VRAM bytes for a given time-batch (nt)
+    during rigid_3d_ref_gpu() / reg_3d_gpu().
+
+    Heuristic components (per batch):
+      - mov batch (complex64 for FFT): nz*nt*ny*nx*complex_bytes
+      - one or two extra FFT work buffers of similar size
+      - mask/filter buffers and phase-corr scratch of similar scale
+    We gather these with a conservative safety multiplier.
+
+    Parameters
+    ----------
+    nz, ny, nx : int
+        Spatial stack dims (after any pre-cropping/padding that reach GPU).
+    dtype_bytes : int
+        Real dtype bytes (float32→4).
+    complex_bytes : int
+        Complex dtype bytes (complex64→8).
+    safety_mult : float
+        Global conservative factor to cover cuFFT work buffers / temporaries.
+
+    Returns
+    -------
+    f(nt: int) -> int
+        Callable that estimates peak VRAM bytes for a given time-batch size.
+    """
+    vox = nz * ny * nx
+    base_complex = vox * complex_bytes  # one complex buffer the size of the batch per time slice
+    # Empirically, the algorithm touches multiple arrays of this scale (mov_fft, ref_fft, corr, masks).
+    # We approximate the "unit" cost per time-slice and scale by nt, then multiply by safety.
+    unit_per_t = 3.0 * base_complex  # mov FFT + corr/work + misc scratch ~ O(3×)
+    def f(nt: int) -> int:
+        est = int(math.ceil(unit_per_t * nt * safety_mult))
+        return est
+    return f
+
+
+def choose_gpu_reference_batch_size(
+    nz: int,
+    ny: int,
+    nx: int,
+    available_vram_bytes: int,
+    max_nt: int,
+    safety_mult: float = 3.0,
+    complex_bytes: int = 8,
+) -> tuple[int, int]:
+    """
+    Pick a batch size (nt) for reference-building that should fit in available VRAM.
+
+    Parameters
+    ----------
+    nz, ny, nx : int
+        Dimensions that reach the GPU (after crop/pad).
+    available_vram_bytes : int
+        VRAM you want to budget for this kernel (e.g., free VRAM minus headroom).
+    max_nt : int
+        Upper bound you *want* (e.g., n_init_files or a test ceiling).
+    safety_mult : float
+        Multiplier passed to the estimator; raise for extra caution.
+    complex_bytes : int
+        complex64 bytes (8).
+
+    Returns
+    -------
+    (nt, est_peak_bytes)
+        nt: chosen batch size (>=1)
+        est_peak_bytes: estimated peak VRAM for that nt
+    """
+    est = estimate_ref3d_vram_bytes_per_batch(nz, ny, nx, complex_bytes=complex_bytes, safety_mult=safety_mult)
+    # Binary search down from max_nt to find the largest nt that fits
+    lo, hi = 1, max(1, max_nt)
+    best_nt, best_est = 1, est(1)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        need = est(mid)
+        if need <= available_vram_bytes:
+            best_nt, best_est = mid, need
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_nt, best_est

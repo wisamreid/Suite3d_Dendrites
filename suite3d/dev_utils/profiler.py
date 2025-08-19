@@ -126,6 +126,8 @@ try:
 except ImportError:
     _nvml_available = False
 
+from tqdm import tqdm
+
 # Global profiling control and log path
 PROFILE_ENABLED = os.getenv("SUITE3D_PROFILING", "1") == "1"
 LOG_FILE = os.getenv("SUITE3D_PROFILE_LOG", "suite3d_profile_log.txt")
@@ -133,6 +135,48 @@ LOG_FILE = os.getenv("SUITE3D_PROFILE_LOG", "suite3d_profile_log.txt")
 # Start tracemalloc for memory tracking and clear log
 tracemalloc.start()
 _log_fh = open(LOG_FILE, 'w', encoding='utf-8')
+
+
+def with_progress(
+    iterable,
+    desc="Processing",
+    total=None,
+    position=0,
+    leave=True,
+    unit="it",
+    dynamic_ncols=True
+):
+    """
+    Lightweight wrapper to show a progress bar for any iterable during manual loops.
+
+    Useful inside functions that you don’t want to decorate or restructure.
+    Especially handy during development and debugging.
+
+    Example:
+        for i in with_progress(range(100), desc="Aligning"):
+            process(i)
+
+    Args:
+        iterable (Iterable): The object to loop over (e.g., range, list).
+        desc (str): Bar label shown in console.
+        total (int): Required for generators if length not inferable.
+        position (int): Vertical offset for bar (nested loops).
+        leave (bool): Keep the bar printed after finishing.
+        unit (str): Unit label (e.g., "frames", "ROIs").
+        dynamic_ncols (bool): Auto-fit to terminal width.
+
+    Returns:
+        tqdm-wrapped iterable
+    """
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        position=position,
+        leave=leave,
+        unit=unit,
+        dynamic_ncols=dynamic_ncols
+    )
 
 
 def parse_profiler_log(log_path, function_name=None, return_all=False):

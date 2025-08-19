@@ -18,10 +18,45 @@ import traceback
 import gc
 import threading
 
+# NOTE: Added Imports
+import re
+from collections import defaultdict
+
 try:
     import cupy as cp
 except ImportError:
     import numpy as cp
+
+
+def init_batches_by_volume(tifs, volumes_per_batch, max_tifs=None):
+    """
+    Group Bruker TIFFs into batches of `volumes_per_batch` volumes.
+    Each volume = all planes+channels for one frame index.
+    """
+    files = list(tifs)
+    if max_tifs is not None:
+        files = files[:max_tifs]
+
+    # 1) Bucket every filename by its frame number
+    pat = re.compile(r"_Cycle\d+_Ch\d+_(\d+)\.ome\.tif$")
+    by_frame = defaultdict(list)
+    for pth in files:
+        m = pat.search(os.path.basename(str(pth)))
+        if not m:
+            continue
+        frame = int(m.group(1))
+        by_frame[frame].append(pth)
+
+    # 2) Sort frames, then chunk them
+    sorted_frames = sorted(by_frame)
+    batches = []
+    for i in range(0, len(sorted_frames), volumes_per_batch):
+        batch = []
+        for f in sorted_frames[i : i + volumes_per_batch]:
+            batch.extend(by_frame[f])
+        batches.append(batch)
+
+    return batches
 
 
 def init_batches(tifs, batch_size, max_tifs_to_analyze=None):
@@ -929,6 +964,22 @@ def register_dataset_gpu_3d(
     jobio = s3dio(job)
 
     refs_and_masks = summary["refs_and_masks"]
+
+    """ Start Of Injected Code """
+
+    # ── Unpack per-plane nonrigid masks + refs ───────────────
+    # Each entry in refs_and_masks is a 6-tuple:
+    # (mask_mul, mask_offset, ref2d, mask_mul_nr, mask_offset_nr, refs_nr_f)
+    mask_mul_nr_list, mask_offset_nr_list, ref_nr_list = zip(*[r[3:] for r in refs_and_masks])
+
+    # stack and immediately drop the singleton “1” dimension
+    mask_mul_nr     = n.stack(mask_mul_nr_list, axis=0)[..., 0, :, :]       # → (n_planes, nb, nby, nbx)
+    mask_offset_nr  = n.stack(mask_offset_nr_list, axis=0)[..., 0, :, :]    # → (n_planes, nb, nby, nbx)
+    ref_nr          = n.stack(ref_nr_list, axis=0)[..., 0, :, :]            # → (n_planes, nb, nby, nbx)
+    # ────────────────────────────────────────────────────────
+
+    """ End Of Injected Code """
+
     ref_img_3d = summary["ref_img_3d"]
     min_pix_vals = summary["min_pix_vals"]
     crosstalk_coeff = summary["crosstalk_coeff"]
@@ -954,22 +1005,18 @@ def register_dataset_gpu_3d(
     # quality metrics on
     top_pix = qm.choose_top_pix(ref_img_3d)
 
-
     # NOTE TODO the current mask_mul etc is uncropped, so currently calculated here but should be changed in reference_image.py
     # when updating to full 3D
 
-    # mask_mul, mask_offset, ref_2ds = n.stack([r[:3] for r in refs_and_masks],axis=1)
-
-    # Current hack to get cropped ref + maks
+    # ── now build the *3D* (cropped) mask+ref for the volume‐wise rigid pass ──
     sigma = reference_params["sigma"]
     ref_img = ref_img_3d.copy()
-    if ypad > 0:
-        ref_img = ref_img[:, int(ypad) : int(-ypad)]
-    if xpad > 0:
-        ref_img = ref_img[:, :, int(xpad) : int(-xpad)]
-    # ref_img = ref_img_3d[:, int(ypad):int(-ypad), int(xpad): int(-xpad)]
-    mask_mul, mask_offset = ref.compute_masks3D(ref_img, sigma)
-    ref_2ds = reg_3d.mask_filter_fft_ref(ref_img, mask_mul, mask_offset, smooth=0.5)
+    if ypad > 0:       ref_img = ref_img[:, int(ypad): int(-ypad)]
+    if xpad > 0:       ref_img = ref_img[:, :, int(xpad): int(-xpad)]
+    # ── 3D masks & refs for the rigid_3d pass ─────────────────
+    mask_mul_3d, mask_offset_3d = ref.compute_masks3D(ref_img, sigma)
+    ref_3d_2ds = reg_3d.mask_filter_fft_ref(ref_img, mask_mul_3d, mask_offset_3d, smooth=0.5)
+    # ────────────────────────────────────────────────────────────────
 
     if params["fuse_shift_override"] is not None:
         fuse_shift = params["fuse_shift_override"]
@@ -1022,7 +1069,22 @@ def register_dataset_gpu_3d(
         "convert_plane_ids_to_channel_ids", True
     )
 
-    batches = init_batches(tifs, tif_batch_size, n_tifs_to_analyze)
+    # Use volume‐based batching only for Bruker lazy mode;
+    # otherwise fall back to the original behavior.
+    if params.get("bruker_lazy", False):
+        # how many complete volumes per batch
+        vols_per_batch = max(
+            1,
+            tif_batch_size // (params["n_ch_tif"] * params["num_colors"])
+        )
+        batches = init_batches_by_volume(
+            tifs,
+            vols_per_batch,
+            max_tifs = params.get("total_tifs_to_analyze", None)
+        )
+    else:
+        batches = init_batches(tifs, tif_batch_size, n_tifs_to_analyze)
+
     n_batches = len(batches)
     __, offset_paths = init_batch_files(
         job_iter_dir, job_reg_data_dir, n_batches, makedirs=False, filename="offsets"
@@ -1095,9 +1157,9 @@ def register_dataset_gpu_3d(
         phase_corr_shifted, int_shift, pc_peak_loc, sub_pixel_shifts, mov_cpu = (
             reg_3d.rigid_3d_ref_gpu(
                 mov_cpu,
-                mask_mul,
-                mask_offset,
-                ref_2ds,
+                mask_mul_3d,    # mask_mul
+                mask_offset_3d, # mask_offset
+                ref_3d_2ds,     # ref_2ds
                 pc_size,
                 batch_size=gpu_reg_batchsize,  # TODO make xpad/ypad automatically integers
                 rmins=rmins,
@@ -1118,7 +1180,7 @@ def register_dataset_gpu_3d(
         log_cb(f"Completed rigid reg on batch in :{time.time() - time_pre_reg}s")
 
         time_shift = time.time()
-        # shift entire abtch on cpu at once
+        # shift entire batch on cpu at once
         # log this info
         mov_shifted = reg_3d.shift_mov_fast(mov_cpu, -int_shift)
 
@@ -1130,12 +1192,62 @@ def register_dataset_gpu_3d(
 
         # NOTE changed this so gets int_shifts + sub_pixel shifts etc
         all_offsets = {}
-        all_offsets["phase_corr_shifted"] = phase_corr_shifted
-        all_offsets["int_shift"] = int_shift
-        all_offsets["pc_peak_loc"] = pc_peak_loc
-        all_offsets["sub_pixel_shifts"] = sub_pixel_shifts
+        all_offsets["phase_corr_shifted"]   = phase_corr_shifted
+        all_offsets["int_shift"]            = int_shift
+        all_offsets["pc_peak_loc"]          = pc_peak_loc
+        all_offsets["sub_pixel_shifts"]     = sub_pixel_shifts
 
         log_cb("After all GPU Batches:", level=3, log_mem_usage=True)
+
+        """ Beginning Of Injected Plane-wise Nonrigid Registration Code """
+
+        # ─── Compute per-plane nonrigid block shifts (GPU) ───
+        import cupy as cp  # make sure cupy is installed & available
+        nr_list_y, nr_list_x = [], []
+        n_planes = mov_shifted.shape[0]
+        for p in range(n_planes):
+            # move plane p to GPU & add dummy plane‐axis
+            pd_gpu = cp.asarray(mov_shifted[p], dtype=cp.float32)  # (n_frames, H, W)
+            mov_gpu_chunk = pd_gpu[None, ...].transpose(1, 0, 2, 3)  # (n_frames, 1, H, W)
+            # compute blockwise shifts
+            y_nr_gpu, x_nr_gpu, _ = reg_gpu.nonrigid_2d_reg_gpu(
+                mov_gpu_chunk,
+                mask_mul_nr[p],
+                mask_offset_nr[p],
+                ref_nr[p][None, ...],
+                yblocks, xblocks,
+                snr_thresh, NRsm,
+                rmins = None, rmaxs = None,
+                max_shift = max_shift_nr, npad = nr_npad,
+                n_smooth_iters = nr_smooth_iters,
+                subpixel = nr_subpixel,
+                log_cb = log_cb)
+            # bring back to CPU as (n_frames, nYb, nXb)
+            nr_list_y.append(y_nr_gpu.get().squeeze(1))
+            nr_list_x.append(x_nr_gpu.get().squeeze(1))
+        # stack into (n_frames, n_planes, nYb, nXb)
+        all_offsets["ymaxs_nr_blocks"] = n.stack(nr_list_y, axis=1)
+        all_offsets["xmaxs_nr_blocks"] = n.stack(nr_list_x, axis=1)
+        log_cb("✔︎ Computed per-plane nonrigid block shifts", 2)
+        # ──────────────────────────────────────────────────────
+
+        """ End Of Injected Plane-wise Nonrigid Registration Code """
+
+        """ Beginning Of Nonrigid Registration Application Code """
+
+        # ─── Apply per-plane nonrigid warps to mov_shifted ───
+        log_cb("Applying per-plane nonrigid warps", 2)
+        for p in range(n_planes):
+            mov_shifted[p] = nonrigid_transform_data(
+                # mov_shifted[p]: shape (n_frames, H, W)
+                mov_shifted[p], nblocks,
+                xblock = xblocks, yblock = yblocks,
+                ymax1 = all_offsets["ymaxs_nr_blocks"][:, p],
+                xmax1 = all_offsets["xmaxs_nr_blocks"][:, p])
+        log_cb("✔︎ Applied all per-plane nonrigid warps", 2)
+        # ───────────────────────────────────────────────────────
+
+        """ End Of Nonrigid Registration Application Code """
 
         if split_tif_size is None:
             split_tif_size = mov_shifted.shape[0]

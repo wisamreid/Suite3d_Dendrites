@@ -9,6 +9,10 @@ from .developer import todo, deprecated
 
 from .io import s3dio
 
+# NOTE: New imports for Bruker data extensions
+import re
+import time
+
 
 def choose_init_tifs(
     tifs, n_init_files, init_file_pool_lims=None, method="even", seed=2358
@@ -64,10 +68,12 @@ def load_init_tifs(
 
 
 def run_init_pass(job):
+
+    t_start = time.time()
+    job.log(f"[INIT PASS] Starting at {time.time() - t_start:.3f}s", 0)
+
     tifs = job.tifs
     params = job.params
-
-    jobio = s3dio(job)
 
     summary_path = os.path.join(job.dirs["summary"], "summary.npy")
     job.log("Saving summary to %s" % summary_path, 0)
@@ -75,12 +81,38 @@ def run_init_pass(job):
         job.log("Summary dir does not exist!!")
         raise ValueError("Summary dir does not exist!!")
 
-    init_tifs = choose_init_tifs(
-        tifs,
-        params["n_init_files"],
-        params["init_file_pool"],
-        params["init_file_sample_method"],
-    )
+    # ── 1) BRUKER / LAZY SPECIAL CASE: sample full volumes by frame‐ID ────
+    t0 = time.time()
+    if job.params.get("bruker", False) or job.params.get("bruker_lazy", False):
+        job.log("Running Bruker mode...", 1)
+        # import re, numpy as n
+        pat = re.compile(r"_Cycle\d+_Ch\d+_([0-9]{6})\.ome\.tif$", re.IGNORECASE)
+        all_frames = sorted({int(m.group(1))
+                             for fn in tifs
+                             if (m := pat.search(fn))})
+        n_init = params["n_init_files"]
+        if n_init < len(all_frames):
+            idxs = n.linspace(0, len(all_frames) - 1, n_init, dtype=int)
+            sel = {all_frames[i] for i in idxs}
+        else:
+            sel = set(all_frames)
+
+        init_tifs = [fn for fn in tifs
+                     if (m := pat.search(fn)) and int(m.group(1)) in sel]
+        job.log(f"▶ init_pass (Bruker) sampling {len(init_tifs)} files → "
+                f"{n_init} volumes", 1)
+
+    # ── DEFAULT PATH (UNCHANGED) ────────────────────────────────────────
+    else:
+        # TODO: Add this to the Bruker loader
+        init_tifs = choose_init_tifs(
+            tifs,
+            params["n_init_files"],
+            params["init_file_pool"],
+            params["init_file_sample_method"],
+        )
+    job.log(f"[INIT PASS] Chose {len(init_tifs)} files for init ({time.time() - t0:.3f}s)", 1)
+
     n_ch_tif = job.params.get("n_ch_tif", 30)
     job.log("Loading init tifs with %d channels" % n_ch_tif)
     todo(
@@ -88,8 +120,14 @@ def run_init_pass(job):
         + "Now, they are inherited from job.params (because job is an attribute of the jobio object.)"
     )
 
+    # ── 2) build movie (If bruker_lazy = True, calls the lazy Dask loader) ───────────────────
+    t1 = time.time()
+    jobio = s3dio(job)
     init_mov = jobio.load_data(init_tifs)
+    job.log(f"[INIT PASS] Loaded init movie {init_mov.shape} ({time.time() - t1:.3f}s)", 1)
 
+    # ── 3) subset or reshape frames ────────────────────────────────────
+    t2 = time.time()
     nz, nt, ny, nx = init_mov.shape
     if params["init_n_frames"] is not None:
         if nt < params["init_n_frames"]:
@@ -107,6 +145,10 @@ def run_init_pass(job):
             init_mov = init_mov[:, subset_ts]
     nz, nt, ny, nx = init_mov.shape
     job.log("Loaded movie with %d frames and shape %d, %d, %d" % (nt, nz, ny, nx))
+    job.log(f"[INIT PASS] Frame subset done ({time.time() - t2:.3f}s)", 1)
+
+    # ── 4) compute 3D mean and enforce positivity ──────────────────────
+    t3 = time.time()
     im3d = init_mov.mean(axis=1)
     im3d_raw = im3d.copy()
     if job.params.get("enforce_positivity", False):
@@ -120,6 +162,10 @@ def run_init_pass(job):
         # job.log("Min pix vals: %s" % str(min_pix_vals.flatten()), 3)
     else:
         min_pix_vals = None
+    job.log(f"[INIT PASS] Mean image + positivity ({time.time() - t3:.3f}s)", 1)
+
+    # ── 5) optional crosstalk subtraction ─────────────────────────────
+    t4 = time.time()
     if params["subtract_crosstalk"] and params["lbm"]:
         if params["override_crosstalk"] is not None:
             cross_coeff = params["override_crosstalk"]
@@ -169,7 +215,10 @@ def run_init_pass(job):
         crosstalk_planes = None
         cross_coeff = None
         ct_info = None
+    job.log(f"[INIT PASS] Crosstalk subtraction ({time.time() - t4:.3f}s)", 1)
 
+    # ── 6) fuse strips ─────────────────────────────────────────────────
+    t5 = time.time()
     if job.params.get("fuse_strips", True):
         xs = jobio.load_roi_start_pix()[1]
         if job.params.get("fuse_shift_override", None) is not None:
@@ -188,7 +237,10 @@ def run_init_pass(job):
         fuse_ccs = None
         xs = None
     # return
+    job.log(f"[INIT PASS] Fuse strips ({time.time() - t5:.3f}s)", 1)
 
+    # ── 7) build reference (3D or 2D) ─────────────────────────────────
+    t6 = time.time()
     reference_params = {
         "percent_contribute": params.get("percent_contribute", 0.9),
         "block_size": params.get("block_size", [128, 128]),
@@ -290,6 +342,11 @@ def run_init_pass(job):
             "og_xs": og_xs,
             "init_tifs": init_tifs,
         }
+
+    job.log(f"[INIT PASS] Reference build ({time.time() - t6:.3f}s)", 1)
+
+    # ── 8) save out summary and wrap up ────────────────────────────────
+    t7 = time.time()
     summary_path = os.path.join(job.dirs["summary"], "summary.npy")
     job.log("Saving summary to %s" % summary_path)
     n.save(summary_path, summary)
@@ -310,3 +367,5 @@ def run_init_pass(job):
 
     job.log("Initial pass complete. See %s for details" % job.dirs["summary"])
     job.summary = summary
+
+    job.log(f"[INIT PASS] Save summary ({time.time() - t7:.3f}s)", 1)

@@ -28,6 +28,9 @@ params = {
     "skip_roi": None,  # if you want to skip one of the mROIs, enter its idx
     "lbm": True,  # whether the data is from light-bead microscopy
     "faced": False,  # whether data is from FACED microscopy,
+    "bruker": False,    # For Bruker style data
+    'convert_multipage': True,  # For Bruker single-page data
+    'bruker_lazy': False,   # Use in‐memory Dask loader for Bruker data
     "faced_nz": None,  # number of z-planes in FACED data
     "multiplane_2p_use_planes": None, # Which planes to analyze in multiplane 2P data (this will only be applied if lbm=False and faced=False)
     # If True, to use safe mode for tif preregistration (slower but more reliable) -- only used if lbm=False and faced=False

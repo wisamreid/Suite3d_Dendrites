@@ -2,6 +2,10 @@
 # It will have functions from suite2P which have been slightly modified
 import numpy as np
 
+# DEBUG IMPORT for Decorations
+# from suite3d.dev_utils.profiler import profile_step
+from suite3d.dev_utils.profiler import with_progress
+
 try:
     import cupy as cp
     import cupyx.scipy.fft as cufft
@@ -107,7 +111,7 @@ def compute_reference_and_masks(
 
     if reference_params.get("plane_to_plane_alignment", True):
         # allign the reference image
-        uncorrected_tvecs = align_planes(ref_image, reference_params)
+        uncorrected_tvecs = align_planes(ref_image, reference_params, log_cb=log_cb)
         # correct bad tvec estimates
         if reference_params.get("fix_shallow_plane_shift_estimates", True):
             shallow_plane_thresh = reference_params.get(
@@ -150,6 +154,7 @@ def compute_reference_and_masks(
     else:
         uncorrected_tvecs = np.zeros((nz, 2))
 
+    log_cb("[compute_reference_and_masks] Apply plane shifts...", 3)
     ref_image = apply_plane_shifts3D(ref_padded, uncorrected_tvecs)
 
     # Option to clip the ref_image per plane for below
@@ -541,63 +546,232 @@ def apply_mask(data, mask_mul, mask_offset):
 # New functions needed for creating a reference image
 
 
-def align_planes(mov3D, reference_params):
+def align_planes(mov3D, reference_params, log_cb=default_log):
     """
-    Input a (nz, ny, nx) movie and this function will find the planeshifts between z-axis
+    Align planes in a 3D movie volume using pairwise 2D FFT-based registration.
+
+    This function estimates x/y shifts between each consecutive plane along the z-axis
+    using phase correlation. It returns cumulative shift vectors that can be used to
+    correct the alignment of each plane in the volume.
+
+    Parameters:
+    -----------
+    mov3D : ndarray (nz, ny, nx)
+        The 3D image volume (z-stack) to be aligned. Typically, this is a reference stack
+        built from averaging or combining multiple 2D frames per plane.
+
+    reference_params : dict
+        Dictionary of parameters for alignment. Expected keys:
+            - "sigma" : float
+                Spatial scale for bandpass masks used during registration
+            - "smooth_sigma" : float
+                Smoothing applied to the per-plane reference computation
+            - "max_reg_xy_reference" : int
+                Maximum shift in pixels allowed for registration
+
+    Returns:
+    --------
+    shifts : ndarray of shape (nz, 2)
+        Array of cumulative (dy, dx) shifts for each z-plane. The first row is always [0, 0].
+
+    Notes:
+    ------
+    - This function operates in-place on `mov3D` after expanding its shape.
+    - Registration is pairwise: each plane is aligned to the one before it.
+    - You can monitor progress via printed progress bars (using tqdm) during:
+        - Reference frame computation
+        - Plane shift estimation
+
+    Future extensions:
+    ------------------
+    - Parallelize per-plane reference or registration steps
+    - GPU acceleration using CuPy or torch
+    - Add quality diagnostics to evaluate alignment strength
     """
-    # print("FUNC CALL")
+
+    # # ───── Preprocess input and parameters ─────────────────────────────────────
+    # # print("FUNC CALL")
+    # log_cb("[align_planes] Running align_planes...", 3)
+    # sigma = reference_params["sigma"]
+    # smooth_sigma = reference_params["smooth_sigma"]
+    # max_reg_xy = reference_params["max_reg_xy_reference"]
+    # ncc = max_reg_xy * 2 + 1
+    #
+    # # ↓↓ NOTE: CHANGE #1: keep global array real (float32) and add a time dimension
+    # mov3D = n.asarray(mov3D, dtype=n.float32)
+    # mov3D = np.expand_dims(mov3D, axis=1)  # (nz, 1, ny, nx)
+    #
+    # # TODO: This is the original code. Check if the replacement code below works and is faster
+    # # # Convert to complex64 for FFT operations, and reshape to (nz, 1, ny, nx)
+    # # mov3D = n.asarray(mov3D, dtype=n.complex64)
+    # # mov3D = np.expand_dims(mov3D, axis=1)
+    #
+    # # --- BEGIN optimized reshape/cast header (instrumented) ---
+    # t_cast0 = time.perf_counter()
+    #
+    # src_dtype = getattr(mov3D, "dtype", None)
+    # src_contig = getattr(mov3D, "flags", {}).c_contiguous if hasattr(mov3D, "flags") else None
+    # src_shape = getattr(mov3D, "shape", None)
+    # src_nbytes = getattr(mov3D, "nbytes", None)
+    #
+    # # Only copy if we must (dtype != float32 or not C-contiguous).
+    # need_copy = (src_dtype != np.float32) or (src_contig is not True)
+    # if need_copy:
+    #     # This is the expensive step when the volume is large.
+    #     mov3D = np.array(mov3D, dtype=np.float32, copy=True, order="C")
+    #     copied_bytes = mov3D.nbytes
+    #     log_cb(f"[align_planes] Casting/copying to float32,C-contig (from dtype={src_dtype}, contig={src_contig}) "
+    #            f"→ {copied_bytes / 1e9:.3f} GB", 3)
+    # else:
+    #     # Zero-copy view path
+    #     mov3D = np.asarray(mov3D, dtype=np.float32)  # view; no copy
+    #     copied_bytes = 0
+    #     log_cb("[align_planes] Reusing existing float32 C-contiguous buffer (zero-copy).", 3)
+    #
+    # # Add singleton time axis as a view (no copy)
+    # # (nz, ny, nx) → (nz, 1, ny, nx)
+    # mov3D = mov3D[:, None, ...]  # view
+    #
+    # t_cast1 = time.perf_counter()
+    # log_cb(f"[align_planes] Header prep done in {(t_cast1 - t_cast0):.3f}s "
+    #        f"(copied={copied_bytes / 1e9:.3f} GB, src_shape={src_shape}, new_shape={mov3D.shape})", 3)
+    # # --- END optimized reshape/cast header ---
+
+    # ───── Preprocess input and parameters ─────────────────────────────────────
+    # ↓↓ NOTE: CHANGE #1: keep global array real (float32)
+
+    log_cb("[align_planes] Running align_planes...", 3)
     sigma = reference_params["sigma"]
     smooth_sigma = reference_params["smooth_sigma"]
     max_reg_xy = reference_params["max_reg_xy_reference"]
-
-    mov3D = n.asarray(mov3D, dtype=n.complex64)
-    mov3D = np.expand_dims(
-        mov3D, axis=1
-    )  # make it (nz, 1, ny, nx) so it is in for used by other registration function
-
-    # set up params
     ncc = max_reg_xy * 2 + 1
+
+    # --- BEGIN normalized, instrumented header ---
+    t_cast0 = time.perf_counter()
+
+    # 1) Start from whatever the caller passed
+    arr = np.asarray(mov3D)  # do NOT force dtype yet
+    src_shape = arr.shape
+    src_dtype = getattr(arr, "dtype", None)
+    src_contig = getattr(arr, "flags", {}).c_contiguous if hasattr(arr, "flags") else None
+
+    # 2) Normalize rank to EXACTLY (nz, nt, ny, nx)
+    if arr.ndim == 3:
+        # (nz, ny, nx) -> (nz, 1, ny, nx)
+        arr = arr[:, None, :, :]
+    elif arr.ndim == 4:
+        # already (nz, nt, ny, nx)
+        pass
+    elif arr.ndim == 5 and arr.shape[1] == 1:
+        # collapse stray singleton time group: (nz, 1, 1, ny, nx) -> (nz, 1, ny, nx)
+        arr = arr[:, 0, :, :, :]
+    else:
+        raise ValueError(f"[align_planes] Unexpected mov3D shape {src_shape}; expected 3D or 4D.")
+
+    # 3) Ensure float32 & C-contiguous with minimal copying
+    need_copy = (arr.dtype != np.float32) or (not arr.flags.c_contiguous)
+    if need_copy:
+        arr = np.array(arr, dtype=np.float32, copy=True, order="C")
+        copied_bytes = arr.nbytes
+        log_cb(
+            f"[align_planes] Casting/copying to float32,C-contig "
+            f"(from dtype={src_dtype}, contig={src_contig}) → {copied_bytes / 1e9:.3f} GB",
+            3,
+        )
+    else:
+        # zero-copy path; still wrap to guarantee a NumPy view
+        arr = np.asarray(arr, dtype=np.float32)
+        copied_bytes = 0
+        log_cb("[align_planes] Reusing existing float32 C-contiguous buffer (zero-copy).", 3)
+
+    mov3D = arr  # use normalized buffer below
     nz, nt, ny, nx = mov3D.shape
+
+    t_cast1 = time.perf_counter()
+    log_cb(
+        f"[align_planes] Header prep done in {(t_cast1 - t_cast0):.3f}s "
+        f"(copied={copied_bytes / 1e9:.3f} GB, src_shape={src_shape}, new_shape={mov3D.shape})",
+        3,
+    )
+
+    # # set up params
+    # nz, nt, ny, nx = mov3D.shape
+    # log_cb(f"[align_planes] mov3D.shape = (nz: {nz}, nt: {nt}, ny: {ny}, nx: {nx})", 3)
+
+    # --- END normalized, instrumented header ---
+
+    # ───── Preallocate outputs ─────────────────────────────────────────────────
     # print("GOT SHAPE")
+    log_cb("[align_planes] Preallocate outputs...", 3)
     ymaxs = n.zeros((nz, nt), dtype=n.int16)
     xmaxs = n.zeros((nz, nt), dtype=n.int16)
     cmaxs = n.zeros((nz, nt), dtype=n.float32)
-    ncc = max_reg_xy * 2 + 1
-    phase_corr = n.zeros((nt, ncc, ncc))
+    phase_corr = n.zeros((nt, ncc, ncc), dtype=n.float32)
 
+    # ───── Generate registration masks ────────────────────────────────────────
     # print("COMPUTING MASKS")
-    mult_mask, add_mask = compute_masks3D(mov3D.squeeze(), sigma)
-    # print("DONE")
+    log_cb("[align_planes] Generating registration masks...", 3)
+    # mult_mask, add_mask = compute_masks3D(mov3D.squeeze(), sigma)
+    mult_mask, add_mask = compute_masks3D(mov3D.squeeze(axis=1), sigma)
 
-    # turn the input mov into a reference image for registration
-    refs_f = np.zeros_like(mov3D)
-    # print("LOOP1")
-    for z in range(nz):
-        # print(z)
-        refs_f[z] = phasecorr_ref(mov3D[z, :, :].squeeze(), smooth_sigma=smooth_sigma)
-    # return None
+    # ───── Compute per-plane references using phase correlation ───────────────
+    # ───── Compute per-plane references (complex) ─────────────────────────────
+    # ↓↓ NOTE: CHANGE #2: explicitly allocate complex64 for refs_f
+    # # turn the input mov into a reference image for registration
+    # refs_f = np.zeros_like(mov3D)
+    refs_f = np.empty((nz, nt, ny, nx), dtype=np.complex64)
+    log_cb("[align_planes] Computing per-plane references using phase correlation...", 3)
+    for z in with_progress(range(nz), desc="Computing per-plane references"):
+        # refs_f[z] = phasecorr_ref(mov3D[z, :, :].squeeze(), smooth_sigma=smooth_sigma)
+        # phasecorr_ref returns complex64 of shape (ny, nx)
+        refs_f[z, 0] = phasecorr_ref(mov3D[z, 0].squeeze(), smooth_sigma=smooth_sigma)
 
-    # find the shifts between two z planes
-    for zidx in range(1, nz):
-        # print(z)
-        mov3D[zidx] = reg.clip_and_mask_mov(
-            mov3D[zidx],
-            None,
-            None,  # can speed thisup with numba/parallelisation?
-            mult_mask[zidx],
-            add_mask[zidx],
+    # ───── Estimate shifts between adjacent z-planes ──────────────────────────
+    log_cb("[align_planes] Estimating z-plane shifts...", 3)
+    for zidx in with_progress(range(1, nz), desc="Estimating z-plane shifts"):
+        # Local complex working buffer (nt, ny, nx); no write-back to mov3D
+        # ↓↓ NOTE: CHANGE #3: make a complex64 temp, do all FFT ops there
+        log_cb(f"[align_planes] Converting plane {zidx} to complex64...", 3)
+        tmp = mov3D[zidx].astype(np.complex64, copy=True)  # shape (1, ny, nx)
+
+        # # Preprocess moving plane with bandpass filter and mask
+        # mov3D[zidx] = reg.clip_and_mask_mov(
+        #     mov3D[zidx],
+        #     None,
+        #     None,
+        #     mult_mask[zidx],
+        #     add_mask[zidx],
+        #     cp=n,
+        # )
+
+        # Preprocess moving plane with bandpass filter and mask
+        tmp = reg.clip_and_mask_mov(
+            tmp,
+            None,None,
+            mult_mask[zidx],    # (ny, nx)
+            add_mask[zidx],     # (ny, nx)
             cp=n,
         )
-        mov3D[zidx] = reg.convolve_2d_cpu(
-            mov3D[zidx], refs_f[zidx - 1]
-        )  # here is zidx and zidx - 1
-        reg.unwrap_fft_2d(mov3D[zidx].real, max_reg_xy, out=phase_corr, cp=n)
+
+        # # Compute phase correlation with previous plane's reference
+        # mov3D[zidx] = reg.convolve_2d_cpu(mov3D[zidx], refs_f[zidx - 1])
+
+        # FFT-based phase correlation against previous plane's reference
+        tmp = reg.convolve_2d_cpu(tmp, refs_f[zidx - 1])
+
+        # reg.unwrap_fft_2d(mov3D[zidx].real, max_reg_xy, out=phase_corr, cp=n)
+        # unwrap expects REAL correlation patch
+        reg.unwrap_fft_2d(tmp.real, max_reg_xy, out=phase_corr, cp=n)
+
+        # Extract peak correlation coordinates (dy, dx)
         ymaxs[zidx], xmaxs[zidx], cmaxs[zidx] = reg.get_max_cc_coord(
             phase_corr, max_reg_xy, cp=n
         )
 
+    # ───── Build cumulative shift vectors ─────────────────────────────────────
     tvecY = -np.cumsum(ymaxs)
     tvecX = -np.cumsum(xmaxs)
+    log_cb("[align_planes] Function finished!", 3)
     return np.stack((tvecY, tvecX), axis=1)
 
 
@@ -1015,6 +1189,72 @@ def pad_mov(mov, plane_shifts):
     mov_pad[:, :, yshift : yshift + nyo, xshift : xshift + nxo] = mov[:]
     return mov_pad, xpad, ypad
 
+# NOTE: This version is faster but I am not currently using it
+# def pad_mov(mov: np.ndarray, plane_shifts: np.ndarray, fill_value: float = 0.0):
+#     """
+#     Pad a 4D movie (nz, nt, ny, nx) so that per-plane (dy, dx) shifts are valid.
+#     Faster implementation:
+#       - computes exact negative/positive pads
+#       - uses np.empty + targeted border fills
+#       - uses np.copyto for central block
+#       - early-return if no padding needed
+#
+#     Returns
+#     -------
+#     mov_pad : ndarray (nz, nt, ny+pad_y0+pad_y1, nx+pad_x0+pad_x1)
+#     xpad : np.ndarray([left, right])
+#     ypad : np.ndarray([top, bottom])
+#     """
+#     t0 = time.perf_counter()
+#
+#     nz, nt, ny, nx = mov.shape
+#     shifts = np.rint(plane_shifts).astype(int)     # (nz, 2) [dy, dx]
+#     dy_min, dy_max = shifts[:, 0].min(), shifts[:, 0].max()
+#     dx_min, dx_max = shifts[:, 1].min(), shifts[:, 1].max()
+#
+#     # pads: [neg, pos] = [top/left, bottom/right]
+#     pad_y0 = max(0, -dy_min)   # top pad if min shift negative
+#     pad_y1 = max(0, +dy_max)   # bottom pad if max shift positive
+#     pad_x0 = max(0, -dx_min)
+#     pad_x1 = max(0, +dx_max)
+#
+#     # Early exit: nothing to do
+#     if (pad_y0 == 0 and pad_y1 == 0 and pad_x0 == 0 and pad_x1 == 0):
+#         return mov, np.array([0, 0], dtype=int), np.array([0, 0], dtype=int)
+#
+#     ypad = np.array([pad_y0, pad_y1], dtype=int)
+#     xpad = np.array([pad_x0, pad_x1], dtype=int)
+#
+#     ny_new = ny + pad_y0 + pad_y1
+#     nx_new = nx + pad_x0 + pad_x1
+#
+#     # Allocate without zeroing entire buffer
+#     mov_pad = np.empty((nz, nt, ny_new, nx_new), dtype=mov.dtype, order="C")
+#
+#     # Fill borders with fill_value (0.0 default)
+#     if pad_y0 > 0:
+#         mov_pad[:, :, :pad_y0, :] = fill_value
+#     if pad_y1 > 0:
+#         mov_pad[:, :, ny_new - pad_y1:, :] = fill_value
+#     if pad_x0 > 0:
+#         mov_pad[:, :, pad_y0:ny_new - pad_y1, :pad_x0] = fill_value
+#     if pad_x1 > 0:
+#         mov_pad[:, :, pad_y0:ny_new - pad_y1, nx_new - pad_x1:] = fill_value
+#
+#     # Copy central block
+#     np.copyto(
+#         mov_pad[:, :, pad_y0:pad_y0 + ny, pad_x0:pad_x0 + nx],
+#         mov
+#     )
+#
+#     t1 = time.perf_counter()
+#     bytes_written = mov_pad.nbytes  # upper bound of total touched bytes
+#     # Optional: replace this print with your logger
+#     # print(f"[pad_mov] pads y={ypad.tolist()} x={xpad.tolist()} "
+#     #       f"→ {ny_new}×{nx_new}; wrote ~{bytes_gib(bytes_written):.2f} GiB in {(t1 - t0):.3f}s")
+#
+#     return mov_pad, xpad, ypad
+
 
 def pad_mov3D(mov, plane_shifts):
     """
@@ -1228,7 +1468,8 @@ def phasecorr_reference(refImg0, maskSlope, smooth_sigma, yblock, xblock):
     )
 
 
-# NEW functions for 3d regsitration
+# NEW functions for 3d registration
+# @profile_step("compute_reference", n_top=10)
 def compute_reference_and_masks_3d(
     mov_cpu, reference_params, log_cb=default_log, rmins=None, rmaxs=None, use_GPU=True
 ):
@@ -1246,12 +1487,13 @@ def compute_reference_and_masks_3d(
 
     # need to do plane_shifts first in 3D case
     log_cb("Computing plane alignment shifts", 1)
-    tvecs = align_planes(mov_cpu.mean(axis=1), reference_params)
+    tvecs = align_planes(mov_cpu.mean(axis=1), reference_params, log_cb=log_cb)
 
     # correct bad tvec estimates
     # print(reference_params)
     # print(tvecs)
     if reference_params.get("fix_shallow_plane_shift_estimates", False):
+        log_cb("Correcting shallow plane shift estimates...", 3)
         shallow_plane_thresh = reference_params.get(
             "fix_shallow_plane_shift_esimate_threshold", 20
         )
@@ -1264,10 +1506,17 @@ def compute_reference_and_masks_3d(
         if bad_planes.sum() > 0:
             log_cb("Fixing %d plane alignment outliers" % bad_planes.sum(), 2)
 
+    log_cb("[compute_reference_and_masks_3d] Running pad_mov...", 3)
     mov_cpu, xpad, ypad = pad_mov(mov_cpu, tvecs)  # pad the movie to correct size
     pad_sizes = [xpad, ypad]
     xpad = int(xpad)
     ypad = int(ypad)
+
+    # NOTE: If running the faster version of this function replace the code above with this:
+    # mov_cpu, xpad, ypad = pad_mov(mov_cpu, tvecs)  # xpad, ypad are [left,right] and [top,bottom]
+    # pad_sizes = [xpad, ypad]  # keep as arrays
+    # # If you truly need scalar shifts for placement, use:
+    # xshift, yshift = xpad[0], ypad[0]
 
     log_cb("Applying plane alignment shifts", 1)
     # print(mov_cpu.shape)
@@ -1376,6 +1625,8 @@ def get_reference_img_gpu_3d(
     log_cb=default_log,
 ):
     # log_cb("Launched")
+    log_cb("[get_reference_img_gpu_3d] Function Launched...", 3)
+    log_cb("[get_reference_img_gpu_3d] NOTE: Implement cropping here!", 3)
     # print(xpad, ypad)
     if ypad == 0:
         if xpad == 0:
@@ -1404,6 +1655,7 @@ def get_reference_img_gpu_3d(
         top_frames = n.argsort(mean_activity_per_frame)[-20:]
         ref_img = mov_cropped[:, top_frames].mean(axis=1)
 
+    log_cb("[get_reference_img_gpu_3d] Computing masks in 3D...", 3)
     mult_mask, add_mask = compute_masks3D(ref_img, sigma)
 
     cmax = np.zeros((niter, mov_cropped.shape[1]))
@@ -1429,8 +1681,9 @@ def get_reference_img_gpu_3d(
         if iter_idx != 0:
             add_mask = compute_mask_offset(ref_img, mult_mask)
 
+        log_cb("[get_reference_img_gpu_3d] Running reg_3d.mask_filter_fft_ref...", 3)
         refs_f = reg_3d.mask_filter_fft_ref(ref_img, mult_mask, add_mask, smooth=0.5)
-
+        log_cb("[get_reference_img_gpu_3d] Running reg_3d.rigid_3d_ref_gpu...", 3)
         phase_corr_shifted, int_shift, pc_peak_loc, subpix_shift, __ = (
             reg_3d.rigid_3d_ref_gpu(
                 mov_cropped,
@@ -1492,6 +1745,7 @@ def get_reference_img_gpu_3d(
 
     # do shift once, use only frames in the reference image to re-center
     # print("Shifting movie")
+    log_cb("[get_reference_img_gpu_3d] Running reg_3d.shift_mov_fast...", 3)
     shifted_mov = reg_3d.shift_mov_fast(
         mov_cpu,
         int_shift[isort, :].mean(axis=0)[np.newaxis, :].astype(np.int32) - int_shift,
