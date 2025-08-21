@@ -1,4 +1,4 @@
-State of Development (as of 8/19/25):
+State of Development (as of 8/21/25):
 
 NOTE:
     Larger n_init_files values give better quality reference images, but it also takes longer.
