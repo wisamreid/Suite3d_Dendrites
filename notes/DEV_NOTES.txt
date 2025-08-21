@@ -1,0 +1,176 @@
+State of Development (as of 8/19/25):
+
+NOTE:
+    Larger n_init_files values give better quality reference images, but it also takes longer.
+    gpu_reference_batch_size = ~8 maxes out GPU memory
+
+TODO:
+1. [*Bruker-4D-ZStack-Registration*] Implement registration sweeps, metrics, & benchmarking in the style of the
+reference sweeps
+2. [iter_step.register_dataset_gpu_3d] I implemented 2D nonrigid registration. Currently this makes the pipeline
+insensitive to the params['nonrigid'] flag. This should be handled by job.register() but should I build it into my
+version of register_dataset_gpu_3d?
+3. [*Bruker-4D-ZStack-Registration*] Improve the relevance of the background images for all vector field outputs
+e.g., the vector field over time gifs should be overlayed on the movie.
+4. [init_pass] Implement choose_init_tifs() for Bruker Lazy mode. Should we do so based on correlations?
+5. [init_pass] Remove extra tooling
+6. [job] Remove @profile decorators from job.run_init_pass() and job.register()
+7. [reference_image] Fix CPU OOM Error in suite3d.reference_image.pad_mov(). Functions are already implemented but
+currently commented out. Test it with 2, 4, or 10 planes. After running with the new pad_mov() the reference building
+step should run on my local hardware.
+NOTE: Current sweep:
+    reference_sweep_params = {"n_init_files": [100, 200, 500]}
+NOTE: See console output:
+    \Suite3D Data\SUITE3D_TEST_OUTPUT\s3d-N_INIT_FILES-TUNING-TSeries-03062025-8sxAA091024M1-009_BU5_Pad_Mov_CPU_OOM_Error\
+8. [reference_image.compute_reference_and_masks_3d] Remove commented out @profile_step decorator
+9. Figure out why plane by plane alignment is not working. Email Andrew
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Demo Scripts:
+
+demos/
++ Sweep-Bruker-4D-ZStack-Registration.py
++ + This is the most recent pipeline script. I was working on a full z-stack when I stopped working on it.
++ + See TODO # 1 & 3
++ + Fix CPU OOM Error See TODO # 7
++ Bruker-4D-ZStack-Registration-Profiler.py
++ + Bruker-4D-ZStack-Registration + profiling
++ Bruker-4D-ZStack-Registration.py
++ + Sweep-Bruker-4D-ZStack-Registration before sweeps
++ Demo-Standard-Data-Register-Only.py
++ + Replication of demo code for registration step only
++ Demo-Standard-Data-Wisam.py
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Modified Files:
+
+suite3d/
+
++ default_params.py
++ + Added Bruker data related flags
+
++ init_pass.py
++ + NOTE: Modified Functions
++ + + run_init_pass()
++ + [run_init_pass]
++ + + For "Bruker Lazy mode" I implemented full volume sampling
++ + + Calls lazy Bruker loader
++ + + Extra Debug Tooling
++ + See TODO # 4 and 5
+
++ iter_step.py
++ + NOTE: Added Functions
++ + + init_batches_by_volume()
++ + [init_batches_by_volume]
++ + + Group Bruker TIFFs into batches of `volumes_per_batch` volumes. Each volume = all planes+channels for one frame index.
++ + NOTE: Modified Functions
++ + + register_dataset_gpu_3d()
++ + [register_dataset_gpu_3d]
++ + + Added plane-wise nonrigid registration code
++ + See TODO # 3
+
++ job.py
++ + NOTE: Added Functions
++ + + generate_registered_zstack(), _preregister_bruker_lazy(), _convert_bruker_stacks(), sweep_reference_params()
++ + [sweep_reference_params]
++ + + Sweeps over reference-building (init_pass) parameters and evaluates resulting volumes.
++ + + Includes reference quality metrics and optionally benchmarking
++ + NOTE: Modified Functions
++ + + __init__(), log(), setup_sweep()
++ + [__init__]
++ + + Added tooling
++ + + Added Bruker data flags (TODO remove Bruker multipage?)
++ + [log]
++ + + replaced unencodable chars
++ + [setup_sweep]
++ + + NOTE: I fixed unresolved variable error: "combinations"
++ + [generate_registered_zstack]
++ + + creates z-projections from the registered movie
++ + See TODO # 6
+
++ quality_metrics.py
++ + NOTE: Added Functions
++ + + compute_reference_quality_metrics()
++ + [compute_reference_quality_metrics] Computes blind quality metrics on a 3D reference volume.
++ + + NOTE: Added histogram entropy, histogram kurtosis, and pca_explained_variance_ratio
+
++ reference_image.py
++ + NOTE: Modified Functions
++ + + align_planes(), pad_mov(), compute_reference_and_masks_3d()
++ + [align_planes]
++ + + Defer complex64 conversion
++ + + NOTE: Less RAM traffic → faster copies, smaller memory footprint → better cache locality, and
+        fewer gigabytes going through the memory bus → lower wall-time
++ + + Shape hygiene without over-copying
++ + + NOTE: Avoids accidental full-volume reallocation, and saves time proportional to the size of the dataset
++ + + Added progress bar with with_progress()
++ + [pad_mov] See TODO # 7
++ + [compute_reference_and_masks_3d] See TODO # 8
++ + + Added tooling
+
++ reg_3d.py
++ + NOTE: Modified Functions
++ + + reg_3d_gpu()
++ + [reg_3d_gpu]
++ + + Added progress bar with with_progress()
+
++ registration_metrics.py
++ + See TODO # 1 (these functions are all relevant)
++ + NOTE: Added Functions
++ + + compute_ncc(), compute_ssim(), compute_mse(), compute_rmse(), compute_residual_motion(),
++ + + compute_mutual_information(), compute_sharpness_fraction(), summarize_metrics()
++ + [compute_ncc]
++ + + Normalized cross‐correlation of each frame against the reference. ref: 2D (H×W), frames: 3D (T×H×W) → returns (T,)
++ + [compute_ssim]
++ + + Structural Similarity Index (SSIM) per frame.
++ + [compute_mse]
++ + + Pixel‐wise mean squared error per frame.
++ + [compute_rmse]
++ + [compute_residual_motion]
++ + + Frame‐to‐frame RMS difference: sqrt(mean((f[t]−f[t−1])²)). Returns length T−1.
++ + [compute_mutual_information]
++ + + Normalized mutual information between ref and each frame.
++ + [compute_sharpness_fraction]
++ + + Fraction of pixels whose Laplacian magnitude > thresh. A basic sharpness proxy.
++ + [summarize_metrics]
++ + + Compute all blind quality metrics before vs. after registration.
+
++ utils.py
++ + NOTE: Added Functions
++ + + find_git_root(), aggregate_profiler_metrics(),
++ + + estimate_ref_gpu_memory_bytes(), max_safe_nt_chunk(), required_vram_for_nt(), bytes_gib(),
++ + + estimate_ref3d_vram_bytes_per_batch(), and choose_gpu_reference_batch_size()
++ + NOTE: These functions are used to implement benchmarking and determining a priori optimal memory parameter settings
+        The function in the first line are in use, the rest are not yet being used
++ + [find_git_root]
++ + + Walks up from start_path (or the current file’s directory) until it finds a folder containing ".git". Returns the
++ + + absolute path to that folder, or raises if none is found.
++ + [aggregate_profiler_metrics]
++ + + Aggregates per-iteration profiler metrics from combo_* subdirectories.
++ + [estimate_ref_gpu_memory_bytes]
++ + + Estimates GPU bytes needed during 3D rigid FFT/phase-correlation for a chunk of nt timepoints (batch), nz planes,
++ + + ny*nx pixels. Default assumes float64 (8 bytes) and ~2 large arrays live at once (e.g., the phase-corr/FFT work
++ + + buffer + one other large buffer). Adjust `live_buffers` if your call site clearly holds more/fewer.
++ + [max_safe_nt_chunk]
++ + + Computes a safe upper bound for gpu_reference_batch_size (nt_chunk).
++ + [required_vram_for_nt]
++ + + A convenience wrapper to report required bytes for a desired nt.
++ + [bytes_gib]
++ + [estimate_ref3d_vram_bytes_per_batch]
++ + + Returns a function f(nt) -> estimated VRAM bytes for a given time-batch (nt) during rigid_3d_ref_gpu() / reg_3d_gpu().
++ + + Heuristic components (per batch): 1) mov batch (complex64 for FFT): nz*nt*ny*nx*complex_bytes 2) one or two extra
++ + + FFT work buffers of similar size and 3) mask/filter buffers and phase-corr scratch of similar scale. We gather
++ + + these with a conservative safety multiplier.
++ + [choose_gpu_reference_batch_size]
++ + + Pick a batch size (nt) for reference-building that should fit in available VRAM.
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Added Files:
+
+suite3d/dev_utils/
++ profiler.py
++ + Decorator function for profiling + helper functions
++ + See TODO # 6 and 8
